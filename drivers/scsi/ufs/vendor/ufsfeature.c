@@ -40,14 +40,6 @@
 #include "ufshcd.h"
 #include "ufs-mediatek.h"
 
-#define UFSHCD_STATE_OPERATIONAL		2	/* ufshcd.c */
-
-/* UFSHCD error handling flags */
-enum {
-	UFSHCD_EH_IN_PROGRESS = (1 << 0),		/* ufshcd.c */
-};
-#define ufshcd_eh_in_progress(h) \
-	((h)->eh_flags & UFSHCD_EH_IN_PROGRESS)		/* ufshcd.c */
 static int ufsf_read_desc(struct ufs_hba *hba, u8 desc_id, u8 desc_index,
 			  u8 selector, u8 *desc_buf, u32 size)
 {

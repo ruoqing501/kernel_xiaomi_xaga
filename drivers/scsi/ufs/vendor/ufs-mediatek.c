@@ -8,7 +8,6 @@
 
 #include <linux/arm-smccc.h>
 #include <linux/bitfield.h>
-#include <linux/cpumask.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_device.h>
@@ -33,34 +32,34 @@
 #include "ufs_quirks.h"
 #include "unipro.h"
 #include "ufs-mediatek.h"
-#include "../ufs-mediatek-dbg.h"
-
-#if IS_ENABLED(CONFIG_MTK_AEE_FEATURE)
-#include <mt-plat/aee.h>
-static int ufs_abort_aee_count;
-#endif
+#include "ufs-mediatek-dbg.h"
+#include  "miufs_ops.h"
 
 #define CREATE_TRACE_POINTS
 #include "ufs-mediatek-trace.h"
 #undef CREATE_TRACE_POINTS
 
+#define ufs_mtk_smc(cmd, val, res) \
+	arm_smccc_smc(MTK_SIP_UFS_CONTROL, \
+		      cmd, val, 0, 0, 0, 0, 0, &(res))
+
 #define ufs_mtk_va09_pwr_ctrl(res, on) \
-	ufs_mtk_smc(UFS_MTK_SIP_VA09_PWR_CTRL, res, on)
+	ufs_mtk_smc(UFS_MTK_SIP_VA09_PWR_CTRL, on, res)
 
 #define ufs_mtk_crypto_ctrl(res, enable) \
-	ufs_mtk_smc(UFS_MTK_SIP_CRYPTO_CTRL, res, enable)
+	ufs_mtk_smc(UFS_MTK_SIP_CRYPTO_CTRL, enable, res)
 
 #define ufs_mtk_ref_clk_notify(on, res) \
-	ufs_mtk_smc(UFS_MTK_SIP_REF_CLK_NOTIFICATION, res, on)
+	ufs_mtk_smc(UFS_MTK_SIP_REF_CLK_NOTIFICATION, on, res)
 
 #define ufs_mtk_device_reset_ctrl(high, res) \
-	ufs_mtk_smc(UFS_MTK_SIP_DEVICE_RESET, res, high)
+	ufs_mtk_smc(UFS_MTK_SIP_DEVICE_RESET, high, res)
 
-#define ufs_mtk_host_pwr_ctrl(on, ufs_version, res) \
-	ufs_mtk_smc(UFS_MTK_SIP_HOST_PWR_CTRL, res, on, ufs_version)
+#define ufs_mtk_host_pwr_ctrl(on, res) \
+	ufs_mtk_smc(UFS_MTK_SIP_HOST_PWR_CTRL, on, res)
 
 #define ufs_mtk_get_vcc_info(res) \
-	ufs_mtk_smc(UFS_MTK_SIP_GET_VCC_INFO, res)
+	ufs_mtk_smc(UFS_MTK_SIP_GET_VCC_INFO, 0, res)
 
 static struct ufs_dev_fix ufs_mtk_dev_fixups[] = {
 	UFS_FIX(UFS_VENDOR_MICRON, UFS_ANY_MODEL,
@@ -724,40 +723,54 @@ static bool ufs_mtk_is_data_cmd(struct scsi_cmnd *cmd)
 	return false;
 }
 
-#define UFS_VEND_SAMSUNG  (1 << 0)
-
 struct tracepoints_table {
 	const char *name;
 	void *func;
 	struct tracepoint *tp;
 	bool init;
-	unsigned int vend;
 };
 
-#if defined(CONFIG_UFSFEATURE)
-static void ufs_mtk_trace_vh_prepare_command_vend_ss(void *data,
-				struct ufs_hba *hba, struct request *rq,
-				struct ufshcd_lrb *lrbp, int *err)
+static void ufs_mtk_trace_vh_prepare_command(void *data, struct ufs_hba *hba, struct request *rq,
+			   struct ufshcd_lrb *lrbp, int *err)
 {
+#if defined(CONFIG_UFSFEATURE)
 	ufsf_change_lun(ufs_mtk_get_ufsf(hba), lrbp);
 	*err = ufsf_prep_fn(ufs_mtk_get_ufsf(hba), lrbp);
+#endif
 }
 
-static void ufs_mtk_trace_vh_compl_command_vend_ss(struct ufs_hba *hba,
-				struct ufshcd_lrb *lrbp,
-				unsigned long out_reqs,
-				unsigned long out_tasks)
+static void ufs_mtk_trace_vh_compl_command(void *data, struct ufs_hba *hba, struct ufshcd_lrb *lrbp)
 {
 	struct scsi_cmnd *cmd = lrbp->cmd;
+	int tag = lrbp->task_tag;
+	unsigned long req_mask;
+	unsigned long outstanding_reqs;
+	unsigned long outstanding_tasks;
+	unsigned long flags;
+
+#if defined(CONFIG_UFSFEATURE)
 	struct utp_upiu_header *header = &lrbp->ucd_rsp_ptr->header;
 	int result = 0;
 	int scsi_status;
 	int ocs;
 	struct ufsf_feature *ufsf = ufs_mtk_get_ufsf(hba);
+#endif
 
 	if (!cmd)
 		return;
 
+	spin_lock_irqsave(hba->host->host_lock, flags);
+	outstanding_reqs = hba->outstanding_reqs;
+	outstanding_tasks = hba->outstanding_tasks;
+	spin_unlock_irqrestore(hba->host->host_lock, flags);
+
+	if (ufs_mtk_is_data_cmd(cmd)) {
+		req_mask = outstanding_reqs & ~(1 << tag);
+		ufs_mtk_biolog_transfer_req_compl(tag, req_mask);
+		ufs_mtk_biolog_check(req_mask);
+	}
+
+#if defined(CONFIG_UFSFEATURE)
 #if defined(CONFIG_UFSSHPB) && defined(CONFIG_HPB_DEBUG)
 	trace_printk("%llu + %u cmd 0x%X comp tag[%d] out %lX\n",
 		     (unsigned long long) blk_rq_pos(cmd->request),
@@ -791,118 +804,66 @@ static void ufs_mtk_trace_vh_compl_command_vend_ss(struct ufs_hba *hba,
 	}
 #if defined(CONFIG_UFSHID)
 	/* Check if it is the last request to be completed */
-	if (!out_tasks && (out_reqs == (1 << lrbp->task_tag)))
+	if (!outstanding_tasks && (outstanding_reqs == (1 << lrbp->task_tag)))
 		schedule_work(&ufsf->on_idle_work);
+#endif
 #endif
 }
 
-static void ufs_mtk_trace_vh_send_tm_command_vend_ss(void *data, struct ufs_hba *hba,
+static void ufs_mtk_trace_vh_send_tm_command(void *data, struct ufs_hba *hba,
 			int tag, const char *str)
 {
+#if defined(CONFIG_UFSFEATURE)
 	struct ufsf_feature *ufsf = ufs_mtk_get_ufsf(hba);
 
 	if (strcmp(str, "tm_complete") == 0)
 		ufsf_reset_lu(ufsf);
 
+#endif
 }
 
-static void ufs_mtk_trace_vh_update_sdev_vend_ss(void *data, struct scsi_device *sdev)
+static void ufs_mtk_trace_vh_update_sdev(void *data, struct scsi_device *sdev)
 {
+#if defined(CONFIG_UFSFEATURE)
 	struct ufs_hba *hba = shost_priv(sdev->host);
 	struct ufsf_feature *ufsf = ufs_mtk_get_ufsf(hba);
 
 	if (hba->dev_info.wmanufacturerid == UFS_VENDOR_SAMSUNG)
 		ufsf_slave_configure(ufsf, sdev);
+#endif
 }
 
-static void ufs_mtk_trace_vh_send_command_vend_ss(void *data, struct ufs_hba *hba,
+static void ufs_mtk_trace_vh_send_command(void *data, struct ufs_hba *hba,
 				struct ufshcd_lrb *lrbp)
 {
+#if defined(CONFIG_UFSFEATURE)
 	struct ufsf_feature *ufsf = ufs_mtk_get_ufsf(hba);
 
 	ufsf_hid_acc_io_stat(ufsf, lrbp);
-}
-#endif
-
-static void ufs_mtk_trace_vh_send_command(void *data, struct ufs_hba *hba, struct ufshcd_lrb *lrbp)
-{
-	struct scsi_cmnd *cmd = lrbp->cmd;
-
-	if (!cmd)
-		return;
-
-	if (ufs_mtk_is_data_cmd(cmd)) {
-		ufs_mtk_biolog_send_command(lrbp->task_tag, cmd);
-		ufs_mtk_biolog_check(1);
-	}
-}
-
-static void ufs_mtk_trace_vh_compl_command(void *data, struct ufs_hba *hba, struct ufshcd_lrb *lrbp)
-{
-	struct scsi_cmnd *cmd = lrbp->cmd;
-	int tag = lrbp->task_tag;
-	unsigned long req_mask;
-	unsigned long outstanding_reqs;
-	unsigned long outstanding_tasks;
-	unsigned long flags;
-#if defined(CONFIG_UFSFEATURE)
-	struct ufsf_feature *ufsf;
-#endif
-
-	if (!cmd)
-		return;
-
-	spin_lock_irqsave(hba->host->host_lock, flags);
-	outstanding_reqs = hba->outstanding_reqs;
-	outstanding_tasks = hba->outstanding_tasks;
-	spin_unlock_irqrestore(hba->host->host_lock, flags);
-
-	if (ufs_mtk_is_data_cmd(cmd)) {
-		req_mask = outstanding_reqs & ~(1 << tag);
-		ufs_mtk_biolog_transfer_req_compl(tag, req_mask);
-		ufs_mtk_biolog_check(req_mask);
-	}
-
-#if defined(CONFIG_UFSFEATURE)
-	ufsf = ufs_mtk_get_ufsf(hba);
-
-	if (ufsf->hba)
-		ufs_mtk_trace_vh_compl_command_vend_ss(hba, lrbp,
-			outstanding_reqs, outstanding_tasks);
 #endif
 }
 
 static struct tracepoints_table interests[] = {
 	{
-		.name = "android_vh_ufs_send_command",
-		.func = ufs_mtk_trace_vh_send_command
+		.name = "android_vh_ufs_prepare_command",
+		.func = ufs_mtk_trace_vh_prepare_command
 	},
 	{
 		.name = "android_vh_ufs_compl_command",
 		.func = ufs_mtk_trace_vh_compl_command
 	},
-#if defined(CONFIG_UFSFEATURE)
-	{
-		.name = "android_vh_ufs_prepare_command",
-		.func = ufs_mtk_trace_vh_prepare_command_vend_ss,
-		.vend = UFS_VEND_SAMSUNG
-	},
 	{
 		.name = "android_vh_ufs_send_tm_command",
-		.func = ufs_mtk_trace_vh_send_tm_command_vend_ss,
-		.vend = UFS_VEND_SAMSUNG
+		.func = ufs_mtk_trace_vh_send_tm_command
 	},
 	{
 		.name = "android_vh_ufs_update_sdev",
-		.func = ufs_mtk_trace_vh_update_sdev_vend_ss,
-		.vend = UFS_VEND_SAMSUNG
+		.func = ufs_mtk_trace_vh_update_sdev
 	},
 	{
 		.name = "android_vh_ufs_send_command",
-		.func = ufs_mtk_trace_vh_send_command_vend_ss,
-		.vend = UFS_VEND_SAMSUNG
+		.func = ufs_mtk_trace_vh_send_command
 	},
-#endif
 };
 
 #define FOR_EACH_INTEREST(i) \
@@ -933,25 +894,20 @@ static void ufs_mtk_uninstall_tracepoints(void)
 	}
 }
 
-static int ufs_mtk_install_tracepoints(struct ufs_hba *hba)
+static int ufs_mtk_install_tracepoints(void)
 {
 	int i;
-	unsigned int vend;
 
 	/* Install the tracepoints */
 	for_each_kernel_tracepoint(ufs_mtk_lookup_tracepoints, NULL);
 
 	FOR_EACH_INTEREST(i) {
 		if (interests[i].tp == NULL) {
-			dev_info(hba->dev, "Error: tracepoint %s not found\n",
+			pr_info("Error: %s not found\n",
 				interests[i].name);
-			continue;
-		}
-
-		vend = interests[i].vend;
-		if (vend & UFS_VEND_SAMSUNG) {
-			if (hba->dev_info.wmanufacturerid != UFS_VENDOR_SAMSUNG)
-				continue;
+			/* Unload previously loaded */
+			ufs_mtk_uninstall_tracepoints();
+			return -EINVAL;
 		}
 
 		tracepoint_probe_register(interests[i].tp,
@@ -1646,6 +1602,7 @@ skip_vcc:
 	host->pm_qos_init = true;
 
 	ufs_mtk_biolog_init(host->qos_allowed, host->boot_device);
+	ufs_mtk_install_tracepoints();
 
 #if IS_ENABLED(CONFIG_SCSI_UFS_MEDIATEK_DBG)
 	ufs_mtk_dbg_register(hba);
@@ -1663,6 +1620,17 @@ skip_vcc:
 					  unsigned int,
 					  void __user *))ufs_mtk_ioctl;
 #endif
+
+#if defined(CONFIG_UFSFEATURE)
+	/*
+	 * hba would be referred by ufsf_reset_host later, it
+	 * needs initialization first.
+	 */
+	host->ufsf.hba = hba;
+	ufsf_set_init_state(ufs_mtk_get_ufsf(hba));
+#endif
+
+
 	goto out;
 
 out_variant_clear:
@@ -1849,9 +1817,6 @@ static int ufs_mtk_device_reset(struct ufs_hba *hba)
 	struct arm_smccc_res res;
 
 #if defined(CONFIG_UFSFEATURE)
-	struct ufsf_feature *ufsf = ufs_mtk_get_ufsf(hba);
-
-	if (ufsf->hba)
 	ufsf_reset_host(ufs_mtk_get_ufsf(hba));
 #endif
 
@@ -1941,7 +1906,6 @@ static void ufs_mtk_vreg_set_lpm(struct ufs_hba *hba, bool lpm)
 static int ufs_mtk_suspend(struct ufs_hba *hba, enum ufs_pm_op pm_op)
 {
 	int err;
-	u64 ufs_version;
 	struct arm_smccc_res res;
 
 	if (ufshcd_is_link_hibern8(hba)) {
@@ -1965,9 +1929,7 @@ static int ufs_mtk_suspend(struct ufs_hba *hba, enum ufs_pm_op pm_op)
 	if (ufshcd_is_link_off(hba))
 		ufs_mtk_device_reset_ctrl(0, res);
 
-	/* Transfer the ufs version to tfa */
-	ufs_version = (u64)hba->dev_info.wspecversion;
-	ufs_mtk_host_pwr_ctrl(false, ufs_version, res);
+	ufs_mtk_host_pwr_ctrl(false, res);
 
 	return 0;
 fail:
@@ -1983,12 +1945,9 @@ fail:
 static int ufs_mtk_resume(struct ufs_hba *hba, enum ufs_pm_op pm_op)
 {
 	int err;
-	u64 ufs_version;
 	struct arm_smccc_res res;
 
-	/* Transfer the ufs version to tfa */
-	ufs_version = (u64)hba->dev_info.wspecversion;
-	ufs_mtk_host_pwr_ctrl(true, ufs_version, res);
+	ufs_mtk_host_pwr_ctrl(true, res);
 
 	err = ufs_mtk_mphy_power_on(hba, true);
 	if (err)
@@ -2050,7 +2009,6 @@ static void ufs_mtk_fix_regulators(struct ufs_hba *hba)
 	if (dev_info->wspecversion >= 0x0300) {
 		if (vreg_info->vccq2) {
 			regulator_disable(vreg_info->vccq2->reg);
-			kfree(vreg_info->vccq2->name);
 			devm_kfree(hba->dev, vreg_info->vccq2);
 			vreg_info->vccq2 = NULL;
 		}
@@ -2059,7 +2017,6 @@ static void ufs_mtk_fix_regulators(struct ufs_hba *hba)
 	} else {
 		if (vreg_info->vccq) {
 			regulator_disable(vreg_info->vccq->reg);
-			kfree(vreg_info->vccq->name);
 			devm_kfree(hba->dev, vreg_info->vccq);
 			vreg_info->vccq = NULL;
 		}
@@ -2070,37 +2027,36 @@ static void ufs_mtk_fix_regulators(struct ufs_hba *hba)
 
 static int ufs_mtk_fixup_vcc_regulator(struct ufs_hba *hba)
 {
-	int err = 0;
+	int ret = 0;
 	u16 ufs_ver;
 	char vcc_name[MAX_PROP_SIZE];
 	struct device *dev = hba->dev;
-	struct ufs_vreg_info *vcc_info = &hba->vreg_info;
+	struct ufs_vreg_info *vreg_info = &hba->vreg_info;
 
 	/* Get UFS version to setting VCC */
 	ufs_ver = (hba->dev_info.wspecversion & 0xF00) >> 8;
 	snprintf(vcc_name, MAX_PROP_SIZE, "vcc_ufs%u", ufs_ver);
 
-	err = ufs_mtk_populate_vreg(dev, vcc_name, &vcc_info->vcc);
-	if (err || !vcc_info->vcc) {
+	ret = ufs_mtk_populate_vreg(dev, vcc_name, &vreg_info->vcc);
+	if (ret) {
 		dev_info(dev, "%s: Unable to find %s\n", __func__, vcc_name);
 		goto out;
 	}
 
-	err = ufs_mtk_get_vreg(dev, vcc_info->vcc);
-	if (err)
+	ret = ufs_mtk_get_vreg(dev, vreg_info->vcc);
+	if (ret)
 		goto out;
 
-	err = regulator_enable(vcc_info->vcc->reg);
-	if (!err)
-		vcc_info->vcc->enabled = true;
+	ret = regulator_enable(vreg_info->vcc->reg);
+	if (!ret)
+		vreg_info->vcc->enabled = true;
 	else
 		dev_info(dev, "%s: %s enable failed, err=%d\n",
-					__func__, vcc_info->vcc->name, err);
+				__func__, vreg_info->vcc->name, ret);
 
 out:
-	if (err)
-		dev_info(hba->dev, "%s: No combo ufs pmic setting\n", __func__);
-	return err;
+	dev_info(hba->dev, "%s: No combo ufs pmic setting\n", __func__);
+	return ret;
 }
 
 static int ufs_mtk_apply_dev_quirks(struct ufs_hba *hba)
@@ -2108,10 +2064,9 @@ static int ufs_mtk_apply_dev_quirks(struct ufs_hba *hba)
 	struct ufs_dev_info *dev_info = &hba->dev_info;
 	u16 mid = dev_info->wmanufacturerid;
 
-	if (mid == UFS_VENDOR_SAMSUNG) {
+	if (mid == UFS_VENDOR_SAMSUNG)
 		ufshcd_dme_set(hba, UIC_ARG_MIB(PA_TACTIVATE), 6);
-		ufshcd_dme_set(hba, UIC_ARG_MIB(PA_HIBERN8TIME), 10);
-	}
+
 	/*
 	 * Decide waiting time before gating reference clock and
 	 * after ungating reference clock according to vendors'
@@ -2165,15 +2120,6 @@ static void ufs_mtk_fixup_dev_quirks(struct ufs_hba *hba)
 		hba->dev_quirks &= ~(UFS_DEVICE_QUIRK_DELAY_BEFORE_LPM |
 			UFS_DEVICE_QUIRK_DELAY_AFTER_LPM);
 	}
-
-	ufs_mtk_install_tracepoints(hba);
-
-#if defined(CONFIG_UFSFEATURE)
-	if (hba->dev_info.wmanufacturerid == UFS_VENDOR_SAMSUNG) {
-		host->ufsf.hba = hba;
-		ufsf_set_init_state(ufs_mtk_get_ufsf(hba));
-	}
-#endif
 }
 
 static void ufs_mtk_event_notify(struct ufs_hba *hba,
@@ -2190,16 +2136,24 @@ static void ufs_mtk_event_notify(struct ufs_hba *hba,
 	 */
 	if (evt == UFS_EVT_HOST_RESET)
 		hba->wlun_dev_clr_ua = false;
+}
 
-#if IS_ENABLED(CONFIG_MTK_AEE_FEATURE)
-	if (evt == UFS_EVT_ABORT && !ufs_abort_aee_count) {
-		cmd_hist_disable();
-		ufs_abort_aee_count++;
-		aee_kernel_warning_api(__FILE__,
-			__LINE__, DB_OPT_FS_IO_LOG,
-			"ufshcd_abort", "timeout at tag %d", val);
+static void ufs_mtk_setup_xfer_req(struct ufs_hba *hba, int tag,
+				   bool is_scsi)
+{
+	struct ufshcd_lrb *lrbp;
+	struct scsi_cmnd *cmd;
+
+	if (is_scsi) {
+		lrbp = &hba->lrb[tag];
+		cmd = lrbp->cmd;
+
+		if (!ufs_mtk_is_data_cmd(cmd))
+			return;
+
+		ufs_mtk_biolog_send_command(tag, cmd);
+		ufs_mtk_biolog_check(1);
 	}
-#endif
 }
 
 static void ufs_mtk_auto_hibern8_disable(struct ufs_hba *hba)
@@ -2228,19 +2182,13 @@ static void ufs_mtk_hibern8_notify(struct ufs_hba *hba, enum uic_cmd_dme cmd,
 
 	if (status == PRE_CHANGE && cmd == UIC_CMD_DME_HIBER_ENTER)
 		ufs_mtk_auto_hibern8_disable(hba);
-
-	if (status == POST_CHANGE && cmd == UIC_CMD_DME_HIBER_ENTER &&
-		hba->dev_info.wmanufacturerid == UFS_VENDOR_MICRON)
-		usleep_range(5000, 5100);
 }
 
 void ufs_mtk_setup_task_mgmt(struct ufs_hba *hba, int tag, u8 tm_function)
 {
 #if defined(CONFIG_UFSFEATURE)
-	struct ufsf_feature *ufsf = ufs_mtk_get_ufsf(hba);
-
-	if (ufsf->hba && (tm_function == UFS_LOGICAL_RESET))
-		ufsf_prepare_reset_lu(ufsf);
+	if (tm_function == UFS_LOGICAL_RESET)
+		ufsf_prepare_reset_lu(ufs_mtk_get_ufsf(hba));
 #endif
 }
 
@@ -2259,6 +2207,7 @@ static const struct ufs_hba_variant_ops ufs_hba_mtk_vops = {
 	.hce_enable_notify   = ufs_mtk_hce_enable_notify,
 	.link_startup_notify = ufs_mtk_link_startup_notify,
 	.pwr_change_notify   = ufs_mtk_pwr_change_notify,
+	.setup_xfer_req      = ufs_mtk_setup_xfer_req,
 	.hibern8_notify      = ufs_mtk_hibern8_notify,
 	.apply_dev_quirks    = ufs_mtk_apply_dev_quirks,
 	.fixup_dev_quirks    = ufs_mtk_fixup_dev_quirks,
@@ -2311,7 +2260,7 @@ static int ufs_mtk_probe(struct platform_device *pdev)
 
 skip_reset:
 	/* perform generic probe */
-	err = ufshcd_pltfrm_init(pdev, &ufs_hba_mtk_vops);
+	err = ufshcd_pltfrm_init_for_mi(pdev, &ufs_hba_mtk_vops);
 
 	if (err) {
 		dev_info(dev, "probe failed %d\n", err);
@@ -2331,16 +2280,6 @@ out:
 	return err;
 }
 
-#if defined(CONFIG_UFSFEATURE)
-static void ufs_mtk_remove_ufsf(struct ufs_hba *hba)
-{
-	struct ufsf_feature *ufsf = ufs_mtk_get_ufsf(hba);
-
-	if (ufsf->hba)
-		ufsf_remove(ufsf);
-}
-#endif
-
 /**
  * ufs_mtk_remove - set driver_data of the device to NULL
  * @pdev: pointer to platform device handle
@@ -2354,7 +2293,7 @@ static int ufs_mtk_remove(struct platform_device *pdev)
 	pm_runtime_get_sync(&(pdev)->dev);
 
 #if defined(CONFIG_UFSFEATURE)
-	ufs_mtk_remove_ufsf(hba);
+	ufsf_remove(ufs_mtk_get_ufsf(hba));
 #endif
 
 	ufshcd_remove(hba);
@@ -2370,14 +2309,13 @@ int ufs_mtk_pltfrm_suspend(struct device *dev)
 	struct ufs_hba *hba = dev_get_drvdata(dev);
 	struct ufsf_feature *ufsf = ufs_mtk_get_ufsf(hba);
 
-	if (ufsf->hba)
 	ufsf_suspend(ufsf);
 #endif
 
 	ret = ufshcd_pltfrm_suspend(dev);
 #if defined(CONFIG_UFSFEATURE)
 	/* We assume link is off */
-	if (ret && ufsf)
+	if (ret)
 		ufsf_resume(ufsf, true);
 #endif
 
@@ -2395,7 +2333,7 @@ int ufs_mtk_pltfrm_resume(struct device *dev)
 
 	ret = ufshcd_pltfrm_resume(dev);
 #if defined(CONFIG_UFSFEATURE)
-	if (!ret && ufsf->hba)
+	if (!ret)
 		ufsf_resume(ufsf, is_link_off);
 #endif
 
@@ -2409,14 +2347,13 @@ int ufs_mtk_pltfrm_runtime_suspend(struct device *dev)
 	struct ufs_hba *hba = dev_get_drvdata(dev);
 	struct ufsf_feature *ufsf = ufs_mtk_get_ufsf(hba);
 
-	if (ufsf->hba)
 	ufsf_suspend(ufsf);
 #endif
 
 	ret = ufshcd_pltfrm_runtime_suspend(dev);
 #if defined(CONFIG_UFSFEATURE)
 	/* We assume link is off */
-	if (ret && ufsf->hba)
+	if (ret)
 		ufsf_resume(ufsf, true);
 #endif
 
@@ -2433,9 +2370,8 @@ int ufs_mtk_pltfrm_runtime_resume(struct device *dev)
 #endif
 
 	ret = ufshcd_pltfrm_runtime_resume(dev);
-
 #if defined(CONFIG_UFSFEATURE)
-	if (!ret && ufsf->hba)
+	if (!ret)
 		ufsf_resume(ufsf, is_link_off);
 #endif
 
@@ -2450,8 +2386,6 @@ void ufs_mtk_shutdown(struct platform_device *pdev)
 
 #if defined(CONFIG_UFSFEATURE)
 	struct ufsf_feature *ufsf = ufs_mtk_get_ufsf(hba);
-
-	if (ufsf->hba)
 	ufsf_suspend(ufsf);
 #endif
 

@@ -14,15 +14,7 @@
 #define QUERY_REQ_TIMEOUT 1500 /* 1.5 seconds */
 /* Task management command timeout */
 #define TM_CMD_TIMEOUT	100 /* msecs */
-#define UFSHCD_STATE_OPERATIONAL		2	/* ufshcd.c */
 
-/* UFSHCD error handling flags */
-enum {
-	UFSHCD_EH_IN_PROGRESS = (1 << 0),		/* ufshcd.c */
-};
-#define ufshcd_eh_in_progress(h) \
-	((h)->eh_flags & UFSHCD_EH_IN_PROGRESS)		/* ufshcd.c */
-	
 bool ufsf__blk_mq_tag_busy(struct blk_mq_hw_ctx *hctx)
 {
 	if (blk_mq_is_sbitmap_shared(hctx->flags)) {

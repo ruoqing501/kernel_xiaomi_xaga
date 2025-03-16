@@ -9,9 +9,10 @@
 #include <linux/bitops.h>
 #include <linux/soc/mediatek/mtk_sip_svc.h>
 #include <linux/pm_qos.h>
-#include "ufshcd.h"
+
 #ifdef CONFIG_UFSFEATURE
-#include "vendor/ufsfeature.h"
+#include "ufshcd.h"
+#include "ufsfeature.h"
 #endif
 
 /*
@@ -195,6 +196,15 @@ struct ufs_mtk_hw_ver {
 	u8 minor;
 	u8 major;
 };
+#if IS_ENABLED(CONFIG_MI_MEMORY_SYSFS)
+struct ufs_uic_stats {
+	u32 pa_err_cnt_total;
+	u32 pa_err_cnt[UFS_EC_PA_MAX];
+	u32 dl_err_cnt_total;
+	u32 dl_err_cnt[UFS_EC_DL_MAX];
+	u32 dme_err_cnt;
+};
+#endif
 struct ufs_mtk_host {
 	struct phy *mphy;
 	struct regulator *reg_va09;
@@ -204,6 +214,9 @@ struct ufs_mtk_host {
 	struct ufs_hba *hba;
 	struct ufs_mtk_crypt_cfg *crypt;
 	struct ufs_mtk_hw_ver hw_ver;
+#if IS_ENABLED(CONFIG_MI_MEMORY_SYSFS)
+	struct ufs_uic_stats ufs_stats;
+#endif
 	enum ufs_mtk_host_caps caps;
 	bool mphy_powered_on;
 	bool unipro_lpm;

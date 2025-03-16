@@ -35,6 +35,7 @@
  * The Linux Foundation chooses to take subject only to the GPLv2
  * license terms, and distributes only under these terms.
  */
+
 #include "ufshcd.h"
 #include "ufsfeature.h"
 #include "ufsshpb.h"
@@ -3792,16 +3793,15 @@ void ufsshpb_reset_host(struct ufsf_feature *ufsf)
 {
 	struct ufsshpb_lu *hpb;
 	int lun;
-	if (ufsshpb_get_state(ufsf) != HPB_FAILED) {
-		ufsshpb_set_state(ufsf, HPB_RESET);
-		seq_scan_lu(lun) {
-			hpb = ufsf->hpb_lup[lun];
-			if (hpb) {
-				INFO_MSG("UFSSHPB lun %d reset", lun);
-				ufsshpb_cancel_jobs(hpb);
-				ufsshpb_drop_retry_list(hpb);
-				ufsshpb_drop_rsp_lists(hpb);
-			}
+
+	ufsshpb_set_state(ufsf, HPB_RESET);
+	seq_scan_lu(lun) {
+		hpb = ufsf->hpb_lup[lun];
+		if (hpb) {
+			INFO_MSG("UFSSHPB lun %d reset", lun);
+			ufsshpb_cancel_jobs(hpb);
+			ufsshpb_drop_retry_list(hpb);
+			ufsshpb_drop_rsp_lists(hpb);
 		}
 	}
 }

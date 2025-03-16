@@ -49,6 +49,15 @@
 #include "ufsringbuf.h"
 
 #define UFS_UPIU_MAX_GENERAL_LUN		8
+#define UFSHCD_STATE_OPERATIONAL		2	/* ufshcd.c */
+
+/* UFSHCD error handling flags */
+enum {
+	UFSHCD_EH_IN_PROGRESS = (1 << 0),		/* ufshcd.c */
+};
+#define ufshcd_eh_in_progress(h) \
+	((h)->eh_flags & UFSHCD_EH_IN_PROGRESS)		/* ufshcd.c */
+
 
 #define UFSFEATURE_QUERY_OPCODE			0x5500
 
@@ -90,7 +99,7 @@
 #define UFSF_QUERY_DESC_UNIT_MAX_SIZE		0x2D
 #define UFSF_QUERY_DESC_GEOMETRY_MAX_SIZE	0x59
 
-#define UFSFEATURE_SELECTOR			0x0
+#define UFSFEATURE_SELECTOR			0x01
 
 /* query_flag  */
 #define MASK_QUERY_UPIU_FLAG_LOC		0xFF
